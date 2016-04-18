@@ -7,14 +7,15 @@ from pprint import pprint
 import argparse
 import numpy as np
 
+import time
 import enrico
+from enrico.appertureLC import AppLC
 from enrico.extern.configobj import ConfigObj, flatten_errors
 from enrico.extern.validate import Validator
 from enrico.environ import CONFIG_DIR, DOWNLOAD_DIR
 from enrico import Loggin, utils
 
-from multiprocessing import Pool, Process, Lock
-mpool = Pool(5) 
+from multiprocessing import Queue, Pool #Pool, Queue, Semaphore, Process, Lock
 
 # SOME CONSTANTS
 TIMEDELAY=6*3600
@@ -27,6 +28,27 @@ met_ref = 353376002.000
 
 tofile=None
 clearfile=True
+
+# Use Torque PBS
+jobscheduler=False
+
+# Internal job scheduler (multiprocessing)
+fqueue = None
+rqueue = None
+fpool  = None
+rpool  = None
+
+def applc_worker(queue):
+  import time
+  while(True):
+    try:
+      item = queue.get(True)
+      if (item=="exit"): break
+      AppLC(item)
+      time.sleep(1)
+    except KeyboardInterrupt:
+      queue.put("exit")
+
 
 # flexible pretty print
 def printc(text):
@@ -109,7 +131,7 @@ class FermiCatalog(object):
     
     src = dict()
     for k in xrange(len(self.NameList)):
-      if name in self.NameList[k]:
+      if name in str(self.NameList[k]):
         src["arg"]      = k
         src["raj2000"]  = self.Table[k][column_raj2000]
         src["decj2000"] = self.Table[k][column_decj2000]
@@ -136,7 +158,7 @@ class Analysis(object):
       type=str, default=os.getcwd(), 
       help='Output dir to save products (default: current dir)')
     parser.add_argument('-l', '--log', dest='log', 
-      type=str, default=None, 
+      type=str, default=os.devnull, 
       help='Output dir to save products (default: current dir)')
     parser.add_argument('-p', '--period', dest='period', 
       type=str, default=PERIOD, 
@@ -147,6 +169,9 @@ class Analysis(object):
     parser.add_argument('-r', '--roi', dest='roi', 
       type=float, default=1, 
       help='Search radius (deg, default: 1deg)')
+    parser.add_argument('-sm', '--simthreads', dest='simthreads', 
+      type=int, default=1, 
+      help='Simultaneous threads / jobs to process')
     parser.add_argument('-b', '--binsize', dest='binsize', 
       type=int, default=6, 
       help='Bin size in hours (default: 6h)')
@@ -169,7 +194,7 @@ class Analysis(object):
     # Update log file
     global tofile
     tofile = os.path.abspath(args.log)
-    printc("-> Parsing arguments: ")
+    printc("-> Parsing arguments")
     #printc(args)
     printc("-> Converting relative paths to absolute")
     self.sourcelistfn = os.path.abspath(self.sourcelistfn)
@@ -232,7 +257,7 @@ class Analysis(object):
     config = ConfigObj(indent_type='\t')
     mes = Loggin.Message()
     config['out']    = self.output+'/%s/'%self.name
-    config['Submit'] = 'yes' 
+    config['Submit'] = 'no' 
     # target
     config['target'] = {}
     config['target']['name'] = self.name
@@ -305,10 +330,8 @@ class Analysis(object):
     # We will always try to run it in parallel, 
     # either with python multiproc or with external torque pbs.
     if config['Submit'] == 'no':
-      global mpool
-      mpool.apply_asyncProcess(AppLC, args=(infile,))
-      mpool.close()
-      #mpool.join()
+      global fqueue
+      fqueue.put(infile)
     else:
       enricodir = environ.DIRS.get('ENRICO_DIR')
       fermidir = environ.DIRS.get('FERMI_DIR')
@@ -324,16 +347,21 @@ class Analysis(object):
     printc("-> Job sent successfully")
 
   def arm_triggers(self):
-    from multiprocessing import Process, Lock
-    #p = Pool(len(self.sourcelist))
-    lock = Lock()
+    global rqueue
     printc("-> Preparing triggers for %s" %(analysis.name))
-    for source in self.sourcelist:
-      args = (lock, self.output, source)
-      Process(target=analyze_results, args=args).start()
-    
+    args={'outdir':self.output, 'source':self.name}
+    rqueue.put(args)
 
-def analyze_results(lock,outdir,source,triggermode='local',fluxref=None,sigma=3):  
+def analysis_worker(queue):
+  while True:
+    try:
+      args = rqueue.get(True)
+      if (args=="exit"): break
+      analyze_results(**args)
+    except KeyboardInterrupt:
+      queue.put("exit")
+
+def analyze_results(outdir,source,triggermode='local',fluxref=None,sigma=3):  
   import time
   from numpy import sum, sqrt
   import astropy.io.fits as pyfits
@@ -342,50 +370,83 @@ def analyze_results(lock,outdir,source,triggermode='local',fluxref=None,sigma=3)
   applcfile = str("%s/%s/%s/%s_fast_applc.fits" \
       %(outdir, source, AppLCPath, source))
   
-  while(not os.isfile(applcfile)):
-    time.sleep(30)
-  
-  with pyfits.open(applcfile) as F: applc = F[1].data
-  total_exp_prev = sum(applc['EXPOSURE'][:-1])
-  total_cts_prev = sum(applc['COUNTS'][:-1])
-  total_err_prev = sqrt(sum(applc['ERROR'][:-1]**2))
-  last_exp = applc['EXPOSURE'][-1]
-  last_cts = applc['COUNTS'][-1]
-  last_err = applc['ERROR'][-1]
+  while(not os.path.isfile(applcfile)):
+    try:
+      F=pyfits.open(applcfile)
+    except:
+      time.sleep(20)
+      continue
+
+    try:
+      applc = F[1].data
+    except:
+      F.close()
+      time.sleep(20)
+      continue
+
+    try:
+      printc(" --> Contents of file %s" %(applcfile))
+      printc(applc)
+      total_exp_prev = sum(applc['EXPOSURE'][:-1])
+      total_cts_prev = sum(applc['COUNTS'][:-1])
+      total_err_prev = sqrt(sum(applc['ERROR'][:-1]**2))
+      last_exp = applc['EXPOSURE'][-1]
+      last_cts = applc['COUNTS'][-1]
+      last_err = applc['ERROR'][-1]
+    except:
+      print("--> Error reading contents")
+    else:
+       break
 
   if (triggermode is 'local'):
     expratio = (1.*last_exp/total_exp_prev)
-    proj_cts = ratio*total_cts_prev
-    proj_err = ratio*total_err_prev
+    proj_cts = expratio*total_cts_prev
+    proj_err = expratio*total_err_prev
     if ((last_cts-proj_cts)>sigma*proj_err):
-      l.acquire()
       printc("-> ALERT: %s might be flaring! Flux is %.1f times the average"\
         %(source,(last_cts-proj_cts)/proj_err))
-      l.release()
       return(True)
     else:
-      l.acquire()
       printc("Flux level: %f +/- %f ph/cm2/s" \
           %(last_cts/last_exp, last_err/last_exp))
-      l.release()
       return(False)
-
   
 
 ##### 2. Query object in the Fermi LAT datacenter
 
-
+iterations=3
 if __name__ == '__main__':
   analysis = Analysis()
+  # Jobs
+  fqueue = Queue()
+  rqueue = Queue()
+  fpool = Pool(analysis.simthreads, applc_worker, (fqueue,))
+  rpool = Pool(analysis.simthreads, analysis_worker,(rqueue,))
   catalog = FermiCatalog(analysis.catalog)
-  #update_fermilat_data()
+  update_fermilat_data()
   #while(analysis.current_source+1<analysis.get_list_of_sources()):
   while(True):
     if (analysis.current_source+1==analysis.get_list_of_sources()):
-        break
-        #time.sleep(3600)
+        printc('Waiting for the ScienceTools threads to finish')
+        if (not jobscheduler): 
+          fpool.close()
+          fpool.join()
+          qpool.put("exit")
+        printc('Waiting for the Analysis threads to finish')
+        rpool.close()
+        rpool.join()
+        qpool.put("exit")
+        printc('Analysis completed')
+        iterations-=1;
+        if(iterations==0): break
+        time.sleep(3600)
+    
     analysis.select_next_source()
     analysis.get_source_coordinates(catalog)
     analysis.write_config()
     analysis.run_analysis()
+    analysis.arm_triggers()
+
+  print('Exiting...')
+
 
