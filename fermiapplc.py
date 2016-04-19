@@ -18,6 +18,7 @@ from enrico import Loggin, utils
 from multiprocessing import Queue, Pool #Pool, Queue, Semaphore, Process, Lock
 
 # SOME CONSTANTS
+VERBOSE=True
 TIMEDELAY=6*3600
 PERIOD="p302"
 CATALOG="/usr/local/enrico/Data/catalog/gll_psc_v16.fit"
@@ -29,6 +30,9 @@ met_ref = 353376002.000
 tofile=None
 clearfile=True
 
+def verbose(message):
+  if (VERBOSE): printc(message)
+
 # Use Torque PBS
 jobscheduler=False
 
@@ -38,17 +42,23 @@ rqueue = None
 fpool  = None
 rpool  = None
 
-def applc_worker(queue):
+def worker(fqueue,rqueue,finished=False):
   import time
+  verbose("%s busy" %(str(os.getpid()))) 
   while(True):
     try:
-      item = queue.get(True)
-      if (item=="exit"): break
-      AppLC(item)
+      if (not fqueue.empty()):
+        verbose("fqueue is not empty")
+        item = fqueue.get(True)
+        AppLC(item)
+      elif (not rqueue.empty()):
+        verbose("rqueue is not empty")
+        args = rqueue.get(True)
+        if (args=="finished"): break
+        analyze_results(**args)
       time.sleep(1)
     except KeyboardInterrupt:
-      queue.put("exit")
-
+      break
 
 # flexible pretty print
 def printc(text):
@@ -145,8 +155,8 @@ class FermiCatalog(object):
 
 class Analysis(object):
   def __init__(self):
-    self.current_source=-1
     self.parse_arguments()
+    self.current_source = -1
 
   def parse_arguments(self):
     parser = argparse.ArgumentParser(
@@ -205,22 +215,25 @@ class Analysis(object):
     return(len(self.sourcelist))
 
   def select_next_source(self):
-    self.current_source = (self.current_source+1)%len(self.sourcelist)
-    self.name = self.sourcelist[self.current_source]
-    return(self.name)
+    self.get_list_of_sources()
+    result = (self.current_source+1)%(len(self.sourcelist)+1)
+    self.current_source = (self.current_source+1)%(len(self.sourcelist))
+    self.name = self.sourcelist[self.current_source%len(self.sourcelist)]
+    return(result)
 
   def get_source_coordinates(self,catalog):
-    printc("-> Solve source name %s with the Fermi-LAT catalog" %(self.name))
+    printc("-> Identifying the source")
+    verbose("-> Solve source name %s with the Fermi-LAT catalog" %(self.name))
     try:
       source = catalog.find_source(self.name)
       self.RA  = source["raj2000"]
       self.DEC = source["decj2000"]
       return(1)
     except:
-      printc("-x Failed to locate source in the Fermi catalog")
+      verbose("-> Failed to locate source in the Fermi catalog")
 
     try:
-      printc("-> Solve source name %s with SIMBAD")
+      verbose("-> Solve source name %s with SIMBAD")
       from astroquery.simbad import Simbad
       object = Simbad.query_object(self.name)
       RA  = np.array(str(object["RA"].data.data[0]).split(" "),dtype=float)
@@ -229,16 +242,17 @@ class Analysis(object):
       self.DEC = (DEC[0]+DEC[1]/60.+DEC[2]/3600.)
       return(1)
     except:
-      printc("-x Failed to solve source name with simbad")
+      verbose("--> Failed to solve source name with simbad")
     
-    printc("Trying name, RA, DEC")
+    verbose("Trying name, RA, DEC")
     try:
       self.name, self.RA, self.DEC = np.array(self.name.split(","))
       self.RA  = float(self.RA)
       self.DEC = float(self.DEC)
     except:
-      printc("-x Something went wrong while processing %s" %self.name)
+      verbose("--> Something went wrong while processing %s" %self.name)
     
+    printc("-> Couldn't identify the source, check %s" %self.name)
     sys.exit(1)
 
 
@@ -295,7 +309,7 @@ class Analysis(object):
     config['analysis'] = {}
     config['analysis']['zmax'] = 100
     # Validate
-    printc(config)
+    verbose(config)
     # Add the rest of the values
     config = get_config(config)
     # Tune the remaining variables
@@ -344,22 +358,13 @@ class Analysis(object):
       JobName = "LC_%s" %self.name
       call(cmd, enricodir, fermidir, scriptname, JobLog, JobName)
     
-    printc("-> Job sent successfully")
+    verbose("--> Job sent successfully")
 
   def arm_triggers(self):
-    global rqueue
-    printc("-> Preparing triggers for %s" %(analysis.name))
+    verbose("--> Preparing triggers for %s" %(analysis.name))
     args={'outdir':self.output, 'source':self.name}
+    global rqueue
     rqueue.put(args)
-
-def analysis_worker(queue):
-  while True:
-    try:
-      args = rqueue.get(True)
-      if (args=="exit"): break
-      analyze_results(**args)
-    except KeyboardInterrupt:
-      queue.put("exit")
 
 def analyze_results(outdir,source,triggermode='local',fluxref=None,sigma=3):  
   import time
@@ -385,8 +390,8 @@ def analyze_results(outdir,source,triggermode='local',fluxref=None,sigma=3):
       continue
 
     try:
-      printc(" --> Contents of file %s" %(applcfile))
-      printc(applc)
+      verbose(" --> Contents of file %s" %(applcfile))
+      verbose(applc)
       total_exp_prev = sum(applc['EXPOSURE'][:-1])
       total_cts_prev = sum(applc['COUNTS'][:-1])
       total_err_prev = sqrt(sum(applc['ERROR'][:-1]**2))
@@ -394,7 +399,7 @@ def analyze_results(outdir,source,triggermode='local',fluxref=None,sigma=3):
       last_cts = applc['COUNTS'][-1]
       last_err = applc['ERROR'][-1]
     except:
-      print("--> Error reading contents")
+      printc("--> Error reading contents")
     else:
        break
 
@@ -420,33 +425,42 @@ if __name__ == '__main__':
   # Jobs
   fqueue = Queue()
   rqueue = Queue()
-  fpool = Pool(analysis.simthreads, applc_worker, (fqueue,))
-  rpool = Pool(analysis.simthreads, analysis_worker,(rqueue,))
+  
+  
+  fpool = Pool(analysis.simthreads, worker, (fqueue,rqueue))
+  printc("-> Loading Fermi-LAT catalog")
   catalog = FermiCatalog(analysis.catalog)
+  printc("-> Updating Fermi-LAT data")
   update_fermilat_data()
-  #while(analysis.current_source+1<analysis.get_list_of_sources()):
+  
+  # Point to the first source in the list 
+  printc("-> Entering ScienceTools analysis loop")
   while(True):
-    if (analysis.current_source+1==analysis.get_list_of_sources()):
-        printc('Waiting for the ScienceTools threads to finish')
-        if (not jobscheduler): 
-          fpool.close()
-          fpool.join()
-          qpool.put("exit")
-        printc('Waiting for the Analysis threads to finish')
-        rpool.close()
-        rpool.join()
-        qpool.put("exit")
-        printc('Analysis completed')
-        iterations-=1;
-        if(iterations==0): break
-        time.sleep(3600)
-    
-    analysis.select_next_source()
+    if (analysis.select_next_source()==analysis.get_list_of_sources()):
+      verbose('--> Waiting for the ScienceTools threads to finish')
+      while (not fqueue.empty()): time.sleep(5)
+      break
+
     analysis.get_source_coordinates(catalog)
     analysis.write_config()
     analysis.run_analysis()
+
+  printc("-> Entering StatisticAnalysis loop")
+  while(True):
+    if (analysis.select_next_source()==analysis.get_list_of_sources()):
+      verbose('--> Waiting for the StatisticAnalysis threads to finish')
+      while (not rqueue.empty()): time.sleep(5)
+      rqueue.put("finished")
+      break
+
     analysis.arm_triggers()
 
-  print('Exiting...')
+  verbose("--> done")
+  fpool.close();
+  fpool.join()
+
+  printc("-> Closing queues")
+  printc('-> Analysis completed')
+  printc('-> Exiting...')
 
 
