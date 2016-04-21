@@ -18,8 +18,10 @@ from enrico import Loggin, utils
 from multiprocessing import Queue, Pool #Pool, Queue, Semaphore, Process, Lock
 
 # SOME CONSTANTS
-VERBOSE=True
-TIMEDELAY=6*3600
+VERBOSE=False
+NTRIALS=10
+UPDATE_FERMI=True
+TIMEDELAY=3*3600
 PERIOD="p302"
 CATALOG="/usr/local/enrico/Data/catalog/gll_psc_v16.fit"
 
@@ -37,12 +39,14 @@ def verbose(message):
 jobscheduler=False
 
 # Internal job scheduler (multiprocessing)
-fqueue = None
-rqueue = None
-fpool  = None
-rpool  = None
+fqueue   = None
+rqueue   = None
+fpool    = None
+rpool    = None
+catalog  = None
+analysis = None
 
-def worker(fqueue,rqueue,finished=False):
+def worker(fqueue,rqueue):
   import time
   verbose("%s busy" %(str(os.getpid()))) 
   while(True):
@@ -52,10 +56,13 @@ def worker(fqueue,rqueue,finished=False):
         item = fqueue.get(True)
         AppLC(item)
       elif (not rqueue.empty()):
-        verbose("rqueue is not empty")
         args = rqueue.get(True)
-        if (args=="finished"): break
-        analyze_results(**args)
+        verbose("rqueue is not empty: %s" %(str(args)))
+        if (args=="stop"):
+          verbose("Finished signal received, breaking the loop")
+          break
+        else:
+          analyze_results(**args)
       time.sleep(1)
     except KeyboardInterrupt:
       break
@@ -76,17 +83,17 @@ def printc(text):
 def fermilat_data_path():
   basepath = "/".join(enrico.__path__[0].split("/")[0:-1])
   datapath = basepath+"/Data/download/"
-  printc("Exploring: "+datapath+"/weekly/photon/")
+  verbose("Exploring: "+datapath+"/weekly/photon/")
   weekly_filelist = [datapath+"/weekly/photon/"+F+"\n" \
     for F in os.listdir(datapath+"/weekly/photon/") if "_"+PERIOD+"_" in F]
   
-  printc("Adding %d files" %(len(weekly_filelist)))
+  verbose("Adding %d files" %(len(weekly_filelist)))
   with open(datapath+"/event.list", "w+") as f:
     f.writelines(weekly_filelist)
 
 def update_fermilat_data():
   from enrico.data import Data
-  printc("-> Getting latest Fermi-LAT weekly files")
+  verbose("-> Getting latest Fermi-LAT weekly files")
   currentdir = os.getcwd()
   data = Data()
   data.download(spacecraft=True, photon=True)
@@ -183,10 +190,10 @@ class Analysis(object):
       type=int, default=1, 
       help='Simultaneous threads / jobs to process')
     parser.add_argument('-b', '--binsize', dest='binsize', 
-      type=int, default=6, 
+      type=int, default=12, 
       help='Bin size in hours (default: 6h)')
     parser.add_argument('-t', '--timewindow', dest='timewindow', 
-      type=int, default=2, 
+      type=int, default=4, 
       help='Time window in days (default: 2d)')
     parser.add_argument('-emin', '--energymin', dest='energymin', 
       type=float, default=100, 
@@ -204,25 +211,26 @@ class Analysis(object):
     # Update log file
     global tofile
     tofile = os.path.abspath(args.log)
-    printc("-> Parsing arguments")
+    verbose("-> Parsing arguments")
     #printc(args)
-    printc("-> Converting relative paths to absolute")
+    verbose("-> Converting relative paths to absolute")
     self.sourcelistfn = os.path.abspath(self.sourcelistfn)
     self.output = os.path.abspath(self.output)
 
   def get_list_of_sources(self):
-    self.sourcelist = np.loadtxt(self.sourcelistfn, dtype=str, ndmin=1, unpack=True)
+    self.sourcelist = np.loadtxt(self.sourcelistfn, dtype=str, \
+        ndmin=1, unpack=True)
     return(len(self.sourcelist))
 
   def select_next_source(self):
     self.get_list_of_sources()
-    result = (self.current_source+1)%(len(self.sourcelist)+1)
-    self.current_source = (self.current_source+1)%(len(self.sourcelist))
+    #result = (self.current_source+1)%(len(self.sourcelist)+1)
+    self.current_source = (self.current_source+1)%(len(self.sourcelist)+1)
     self.name = self.sourcelist[self.current_source%len(self.sourcelist)]
-    return(result)
+    return(self.current_source)
 
   def get_source_coordinates(self,catalog):
-    printc("-> Identifying the source")
+    verbose("-> Identifying the source")
     verbose("-> Solve source name %s with the Fermi-LAT catalog" %(self.name))
     try:
       source = catalog.find_source(self.name)
@@ -264,7 +272,7 @@ class Analysis(object):
     self.timemax = dt2met(available)
 
   def write_config(self):
-    printc("-> Write config file for %s" %(self.name))
+    verbose("-> Write config file for %s" %(self.name))
     import enrico
     from enrico.config import get_config
     # Create object
@@ -275,8 +283,8 @@ class Analysis(object):
     # target
     config['target'] = {}
     config['target']['name'] = self.name
-    config['target']['ra']   = str("%.4s" %self.RA)
-    config['target']['dec']  = str("%.4s" %self.DEC)
+    config['target']['ra']   = str("%.4f" %self.RA)
+    config['target']['dec']  = str("%.4f" %self.DEC)
     config['target']['redshift'] = '0'
     config['target']['spectrum'] = 'PowerLaw'
     # space
@@ -300,6 +308,7 @@ class Analysis(object):
     config['energy'] = {}
     config['energy']['emin'] = self.energymin
     config['energy']['emax'] = self.energymax
+    config['energy']['enumbins_per_decade'] = 3
     # event class
     config['event'] = {}
     config['event']['irfs'] = 'CALDB'
@@ -331,7 +340,6 @@ class Analysis(object):
     shutil.rmtree(fname, ignore_errors=True)
 
   def run_analysis(self):
-    printc("-> Running the analysis for %s" %(analysis.name))
     import shutil
     from enrico import environ
     from enrico.config import get_config
@@ -340,6 +348,8 @@ class Analysis(object):
     from enrico.constants import AppLCPath
     infile = self.configfile
     config = get_config(infile)
+    
+    verbose("-> Running the analysis for %s" %(analysis.name))
 
     # We will always try to run it in parallel, 
     # either with python multiproc or with external torque pbs.
@@ -374,24 +384,31 @@ def analyze_results(outdir,source,triggermode='local',fluxref=None,sigma=3):
   # Retrieve results
   applcfile = str("%s/%s/%s/%s_fast_applc.fits" \
       %(outdir, source, AppLCPath, source))
-  
-  while(not os.path.isfile(applcfile)):
+ 
+  trials=NTRIALS;
+  while(True):
     try:
       F=pyfits.open(applcfile)
     except:
-      time.sleep(20)
+      time.sleep(30)
       continue
+    else:
+      trials=NTRIALS
 
     try:
       applc = F[1].data
     except:
+      verbose("--> Cannot open fits table, closing it")
       F.close()
-      time.sleep(20)
+      time.sleep(30)
+      trials-=1
+      if (trials==0):
+        verbose("--> FatalError opening fits table in %s." %source); break
       continue
+    else:
+      trials=NTRIALS
 
     try:
-      verbose(" --> Contents of file %s" %(applcfile))
-      verbose(applc)
       total_exp_prev = sum(applc['EXPOSURE'][:-1])
       total_cts_prev = sum(applc['COUNTS'][:-1])
       total_err_prev = sqrt(sum(applc['ERROR'][:-1]**2))
@@ -399,25 +416,65 @@ def analyze_results(outdir,source,triggermode='local',fluxref=None,sigma=3):
       last_cts = applc['COUNTS'][-1]
       last_err = applc['ERROR'][-1]
     except:
-      printc("--> Error reading contents")
+      verbose("--> Error reading contents.")
+      time.sleep(30)
+      trials-=1
+      if (trials==0):
+        verbose("--> FatalError reading contents." %source); break
+      continue
     else:
-       break
+      break
 
-  if (triggermode is 'local'):
+  printc("-> ##### %s #####" %source)
+  verbose("--> Contents of file %s" %(applcfile))
+  verbose(applc)
+
+  if (triggermode=='local'):
     expratio = (1.*last_exp/total_exp_prev)
     proj_cts = expratio*total_cts_prev
     proj_err = expratio*total_err_prev
     if ((last_cts-proj_cts)>sigma*proj_err):
-      printc("-> ALERT: %s might be flaring! Flux is %.1f times the average"\
+      printc("--> Flux: (%e +/- %.2e) ph/cm2/s" \
+          %(last_cts/last_exp, last_err/last_exp))
+      printc("--> ALERT: %s might be flaring! Excess is %1.2f sigma above average"\
         %(source,(last_cts-proj_cts)/proj_err))
       return(True)
     else:
-      printc("Flux level: %f +/- %f ph/cm2/s" \
-          %(last_cts/last_exp, last_err/last_exp))
+      printc("-> Flux: (%e +/- %.2e) ph/cm2/s [%1.2f sigma]"\
+          %(last_cts/last_exp, last_err/last_exp,\
+            (last_cts-proj_cts)/proj_err))
       return(False)
   
 
-##### 2. Query object in the Fermi LAT datacenter
+##### Main iterator
+
+def full_analysis():
+    verbose("-> Updating Fermi-LAT data")
+    if (UPDATE_FERMI): update_fermilat_data()
+    
+    # Point to the first source in the list 
+    verbose("-> Entering ScienceTools analysis loop")
+    while(True):
+      if (analysis.select_next_source()==analysis.get_list_of_sources()):
+        verbose('--> Waiting for the ScienceTools threads to finish')
+        while (not fqueue.empty()): time.sleep(10)
+        break
+
+      analysis.get_source_coordinates(catalog)
+      analysis.write_config()
+      analysis.run_analysis()
+
+    verbose("-> Entering StatisticAnalysis loop")
+    while(True):
+      if (analysis.select_next_source()==analysis.get_list_of_sources()):
+        verbose('--> Waiting for the StatisticAnalysis threads to finish')
+        while (not rqueue.empty()): time.sleep(10)
+        break
+
+      analysis.arm_triggers()
+    
+
+##### Main loop
 
 iterations=3
 if __name__ == '__main__':
@@ -425,42 +482,22 @@ if __name__ == '__main__':
   # Jobs
   fqueue = Queue()
   rqueue = Queue()
-  
-  
   fpool = Pool(analysis.simthreads, worker, (fqueue,rqueue))
-  printc("-> Loading Fermi-LAT catalog")
+  verbose("-> Loading Fermi-LAT catalog")
   catalog = FermiCatalog(analysis.catalog)
-  printc("-> Updating Fermi-LAT data")
-  update_fermilat_data()
   
-  # Point to the first source in the list 
-  printc("-> Entering ScienceTools analysis loop")
   while(True):
-    if (analysis.select_next_source()==analysis.get_list_of_sources()):
-      verbose('--> Waiting for the ScienceTools threads to finish')
-      while (not fqueue.empty()): time.sleep(5)
-      break
+    full_analysis()
+    time.sleep(3600)
 
-    analysis.get_source_coordinates(catalog)
-    analysis.write_config()
-    analysis.run_analysis()
-
-  printc("-> Entering StatisticAnalysis loop")
-  while(True):
-    if (analysis.select_next_source()==analysis.get_list_of_sources()):
-      verbose('--> Waiting for the StatisticAnalysis threads to finish')
-      while (not rqueue.empty()): time.sleep(5)
-      rqueue.put("finished")
-      break
-
-    analysis.arm_triggers()
-
-  verbose("--> done")
+  for p in xrange(analysis.simthreads):
+    rqueue.put("stop")
+  
   fpool.close();
   fpool.join()
 
-  printc("-> Closing queues")
+  verbose("-> Closing queues")
   printc('-> Analysis completed')
-  printc('-> Exiting...')
+  verbose('-> Exiting...')
 
 
