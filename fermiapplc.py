@@ -7,6 +7,8 @@ from pprint import pprint
 import argparse
 import numpy as np
 
+import urllib2
+
 import time
 import enrico
 from enrico.appertureLC import AppLC
@@ -18,9 +20,8 @@ from enrico import Loggin, utils
 from multiprocessing import Queue, Pool #Pool, Queue, Semaphore, Process, Lock
 
 # SOME CONSTANTS
-VERBOSE=False
 NTRIALS=10
-UPDATE_FERMI=True
+UPDATE_FERMI=False
 TIMEDELAY=3*3600
 PERIOD="p302"
 CATALOG="/usr/local/enrico/Data/catalog/gll_psc_v16.fit"
@@ -31,9 +32,10 @@ met_ref = 353376002.000
 
 tofile=None
 clearfile=True
+verbosemode=None
 
 def verbose(message):
-  if (VERBOSE): printc(message)
+  if (verbosemode): printc("[VERBOSE] "+message)
 
 # Use Torque PBS
 jobscheduler=False
@@ -48,7 +50,7 @@ analysis = None
 
 def worker(fqueue,rqueue):
   import time
-  verbose("%s busy" %(str(os.getpid()))) 
+  verbose("%s busy" %(str(os.getpid())))
   while(True):
     try:
       if (not fqueue.empty()):
@@ -86,7 +88,7 @@ def fermilat_data_path():
   verbose("Exploring: "+datapath+"/weekly/photon/")
   weekly_filelist = [datapath+"/weekly/photon/"+F+"\n" \
     for F in os.listdir(datapath+"/weekly/photon/") if "_"+PERIOD+"_" in F]
-  
+
   verbose("Adding %d files" %(len(weekly_filelist)))
   with open(datapath+"/event.list", "w+") as f:
     f.writelines(weekly_filelist)
@@ -99,6 +101,7 @@ def update_fermilat_data():
   data.download(spacecraft=True, photon=True)
   fermilat_data_path()
   os.chdir(currentdir)
+
 
 def get_current_datetime():
   from datetime.datetime import utcnow
@@ -145,7 +148,7 @@ class FermiCatalog(object):
     column_glon     = 3
     column_glat     = 4
     column_pwlindex = 30
-    
+
     src = dict()
     for k in xrange(len(self.NameList)):
       if name in str(self.NameList[k]):
@@ -157,57 +160,61 @@ class FermiCatalog(object):
         src["pwlindex"] = self.Table[k][column_pwlindex]
         return(src)
 
-    printc("Source name %s not found!." %name) 
+    printc("Source name %s not found!." %name)
 
 
 class Analysis(object):
   def __init__(self):
     self.parse_arguments()
     self.current_source = -1
+    self.band='fu'
 
   def parse_arguments(self):
     parser = argparse.ArgumentParser(
       description='Create Fermi Apperture LCs for the given objects.')
     parser.add_argument('sourcelistfn', metavar='sourcelistfn',
-      type=str, 
+      type=str,
       help='Filename with a list of source to analyze')
-    parser.add_argument('-o', '--output', dest='output', 
-      type=str, default=os.getcwd(), 
+    parser.add_argument('-o', '--output', dest='output',
+      type=str, default=os.getcwd(),
       help='Output dir to save products (default: current dir)')
-    parser.add_argument('-l', '--log', dest='log', 
-      type=str, default=os.devnull, 
+    parser.add_argument('-l', '--log', dest='log',
+      type=str, default=os.devnull,
       help='Output dir to save products (default: current dir)')
-    parser.add_argument('-p', '--period', dest='period', 
-      type=str, default=PERIOD, 
+    parser.add_argument('-p', '--period', dest='period',
+      type=str, default=PERIOD,
       help=str('Select period (default: %s)' %PERIOD))
-    parser.add_argument('-c', '--catalog', dest='catalog', 
-      type=str, default=CATALOG, 
+    parser.add_argument('-c', '--catalog', dest='catalog',
+      type=str, default=CATALOG,
       help=str('Catalog file path (default: %s)' %CATALOG))
-    parser.add_argument('-r', '--roi', dest='roi', 
-      type=float, default=1, 
+    parser.add_argument('-r', '--roi', dest='roi',
+      type=float, default=1,
       help='Search radius (deg, default: 1deg)')
-    parser.add_argument('-sm', '--simthreads', dest='simthreads', 
-      type=int, default=1, 
+    parser.add_argument('-sm', '--simthreads', dest='simthreads',
+      type=int, default=1,
       help='Simultaneous threads / jobs to process')
-    parser.add_argument('-b', '--binsize', dest='binsize', 
-      type=int, default=12, 
+    parser.add_argument('-b', '--binsize', dest='binsize',
+      type=int, default=12,
       help='Bin size in hours (default: 6h)')
-    parser.add_argument('-t', '--timewindow', dest='timewindow', 
-      type=int, default=4, 
+    parser.add_argument('-t', '--timewindow', dest='timewindow',
+      type=int, default=4,
       help='Time window in days (default: 2d)')
-    parser.add_argument('-emin', '--energymin', dest='energymin', 
-      type=float, default=100, 
+    parser.add_argument('-emin', '--energymin', dest='energymin',
+      type=float, default=100,
       help='Minimum energy in MeV (default: 100MeV)')
-    parser.add_argument('-emax', '--energymax', dest='energymax', 
-      type=float, default=300000, 
+    parser.add_argument('-ecut', '--energycut', dest='energycut',
+      type=float, default=1000,
+      help='Minimum energy in MeV (default: 100MeV)')
+    parser.add_argument('-emax', '--energymax', dest='energymax',
+      type=float, default=300000,
       help='Maximum energy in MeV (default: 300000MeV)')
-    parser.add_argument('--index', dest='spindex', 
-      type=float, default=2.0, 
+    parser.add_argument('--index', dest='spindex',
+      type=float, default=2.0,
       help='Spectral Index (assuming PWL) (default: 2.0)')
 
     args = parser.parse_args()
     vars(self).update(args.__dict__)
-    
+
     # Update log file
     global tofile
     tofile = os.path.abspath(args.log)
@@ -228,6 +235,51 @@ class Analysis(object):
     self.current_source = (self.current_source+1)%(len(self.sourcelist)+1)
     self.name = self.sourcelist[self.current_source%len(self.sourcelist)]
     return(self.current_source)
+
+  def query_fermilat_data(self,retrytimes=5):
+    import urllib2
+    from astroquery.fermi import FermiLAT
+    object=self.name
+    Erange = str("%d, %d" %(self.energymin,self.energymax))
+    LATdatatype = "Extended"
+    self.calculate_times()
+    timesys = 'MET'
+    obsdates = str("%s, %s" %(str(self.timemin),"END")) #str(self.timemax)))
+    verbose("Query:")
+    verbose(str("%s, %s, %s, %s, %s, %s" \
+        %(object, Erange, self.roi, LATdatatype, obsdates, timesys)))
+
+    result = FermiLAT.query_object(\
+        name_or_coords=object,\
+        energyrange_MeV=Erange,\
+        searchradius=self.roi,\
+        LATdatatype=LATdatatype,\
+        obsdates=obsdates,\
+        timesys=timesys)
+
+    for url in result:
+      verbose("Downloading file %s" %url.split("/")[-1])
+      u = urllib2.urlopen(url)
+      with open("%s/%s" %(self.output,url.split("/")[-1]), "wb") as f:
+        f.write(u.read())
+
+    try: 
+      self.SCfile = [str("%s/%s" %(self.output,r.split("/")[-1])) \
+          for r in result if "_SC" in r][0]
+      self.PHlist = [str("%s/%s" %(self.output,r.split("/")[-1])) \
+          for r in result if "_PH" in r or "_EV" in r]
+    except:
+      if (retrytimes==0):
+        printc("Error. Cannot resolv source %s" %object)
+        sys.exit(1)
+      else:
+        verbose("Retrying %s, left %d" %(object, retrytimes-1))
+        self.query_fermilat_data(retrytimes-1)
+        return
+      
+    self.PHfile = str("%s/phfiles_%s.txt" %(self.output,self.name))
+    with open(self.PHfile,'w') as f:
+      f.write(str('\n'.join(self.PHlist)+'\n'))
 
   def get_source_coordinates(self,catalog):
     verbose("-> Identifying the source")
@@ -251,7 +303,7 @@ class Analysis(object):
       return(1)
     except:
       verbose("--> Failed to solve source name with simbad")
-    
+
     verbose("Trying name, RA, DEC")
     try:
       self.name, self.RA, self.DEC = np.array(self.name.split(","))
@@ -259,7 +311,7 @@ class Analysis(object):
       self.DEC = float(self.DEC)
     except:
       verbose("--> Something went wrong while processing %s" %self.name)
-    
+
     printc("-> Couldn't identify the source, check %s" %self.name)
     sys.exit(1)
 
@@ -278,8 +330,8 @@ class Analysis(object):
     # Create object
     config = ConfigObj(indent_type='\t')
     mes = Loggin.Message()
-    config['out']    = self.output+'/%s/'%self.name
-    config['Submit'] = 'no' 
+    config['out']    = self.output+'/%s_%s/'%(self.name,self.band)
+    config['Submit'] = 'no'
     # target
     config['target'] = {}
     config['target']['name'] = self.name
@@ -293,11 +345,13 @@ class Analysis(object):
     config['space']['yref'] = config['target']['dec']
     config['space']['rad']  = self.roi
     # files
-    basepath = "/".join(enrico.__path__[0].split("/")[0:-1])
-    datapath = basepath+"/Data/download/"
+    #basepath = "/".join(enrico.__path__[0].split("/")[0:-1])
+    #datapath = basepath+"/Data/download/"
     config['file'] = {}
-    config['file']['spacecraft'] = str("%s/lat_spacecraft_merged.fits" %datapath)
-    config['file']['event']      = str("%s/event.list" %datapath)
+    #config['file']['spacecraft'] = str("%s/lat_spacecraft_merged.fits" %datapath)
+    #config['file']['event']      = str("%s/event.list" %datapath)
+    config['file']['spacecraft'] = self.SCfile
+    config['file']['event']      = self.PHfile
     config['file']['tag']        = 'fast'
     # time
     config['time'] = {}
@@ -306,13 +360,21 @@ class Analysis(object):
     config['time']['tmax'] = self.timemax
     # energy
     config['energy'] = {}
-    config['energy']['emin'] = self.energymin
-    config['energy']['emax'] = self.energymax
-    config['energy']['enumbins_per_decade'] = 3
+    if (self.band=='lo'):
+      config['energy']['emin'] = self.energymin
+      config['energy']['emax'] = self.energycut
+    elif (self.band=='hi'):
+      config['energy']['emin'] = self.energycut
+      config['energy']['emax'] = self.energymax
+    else:
+      config['energy']['emin'] = self.energymin
+      config['energy']['emax'] = self.energymax
+
+    config['energy']['enumbins_per_decade'] = 5
     # event class
     config['event'] = {}
     config['event']['irfs'] = 'CALDB'
-    config['event']['evclass'] = '128'
+    config['event']['evclass'] = '64' #'128' #64=transients, 128=source
     config['event']['evtype'] = '3'
     # analysis
     config['analysis'] = {}
@@ -324,19 +386,20 @@ class Analysis(object):
     # Tune the remaining variables
     config['AppLC']['index'] = self.spindex
     config['AppLC']['NLCbin'] = int(24*self.timewindow/self.binsize+0.5)
+    config['AppLC']['rad']  = self.roi
     # Write config file
-    self.configfile = str("%s/%s.conf" %(self.output,self.name))
+    self.configfile = str("%s/%s_%sE.conf" %(self.output,self.name,self.band))
     with open(self.configfile,'w') as f:
       config.write(f)
 
   def get_data(self):
     from astroquery.fermi import FermiLAT
-  
+
   def remove_prev_dir(self):
     from enrico.constants import AppLCPath
     import shutil
-    fname = str("%s/%s/%s/%s_fast_applc.fits" \
-        %(self.output, self.name, AppLCPath, self.name))
+    fname = str("%s/%s/" \
+        %(self.output, self.name))
     shutil.rmtree(fname, ignore_errors=True)
 
   def run_analysis(self):
@@ -348,10 +411,12 @@ class Analysis(object):
     from enrico.constants import AppLCPath
     infile = self.configfile
     config = get_config(infile)
-    
+
+    self.remove_prev_dir()
+
     verbose("-> Running the analysis for %s" %(analysis.name))
 
-    # We will always try to run it in parallel, 
+    # We will always try to run it in parallel,
     # either with python multiproc or with external torque pbs.
     if config['Submit'] == 'no':
       global fqueue
@@ -367,7 +432,7 @@ class Analysis(object):
       JobLog = prefix + "_Job.log"
       JobName = "LC_%s" %self.name
       call(cmd, enricodir, fermidir, scriptname, JobLog, JobName)
-    
+
     verbose("--> Job sent successfully")
 
   def arm_triggers(self):
@@ -376,7 +441,7 @@ class Analysis(object):
     global rqueue
     rqueue.put(args)
 
-def analyze_results(outdir,source,triggermode='local',fluxref=None,sigma=3):  
+def analyze_results(outdir,source,triggermode='local',fluxref=None,sigma=3):
   import time
   from numpy import sum, sqrt
   import astropy.io.fits as pyfits
@@ -384,7 +449,7 @@ def analyze_results(outdir,source,triggermode='local',fluxref=None,sigma=3):
   # Retrieve results
   applcfile = str("%s/%s/%s/%s_fast_applc.fits" \
       %(outdir, source, AppLCPath, source))
- 
+
   trials=NTRIALS;
   while(True):
     try:
@@ -444,35 +509,43 @@ def analyze_results(outdir,source,triggermode='local',fluxref=None,sigma=3):
           %(last_cts/last_exp, last_err/last_exp,\
             (last_cts-proj_cts)/proj_err))
       return(False)
-  
+
 
 ##### Main iterator
 
 def full_analysis():
     verbose("-> Updating Fermi-LAT data")
     if (UPDATE_FERMI): update_fermilat_data()
-    
-    # Point to the first source in the list 
+
+    # Point to the first source in the list
     verbose("-> Entering ScienceTools analysis loop")
     while(True):
       if (analysis.select_next_source()==analysis.get_list_of_sources()):
         verbose('--> Waiting for the ScienceTools threads to finish')
         while (not fqueue.empty()): time.sleep(10)
+        # Removing data files:
         break
 
-      analysis.get_source_coordinates(catalog)
-      analysis.write_config()
-      analysis.run_analysis()
+      for band in ["lo","hi"]:
+        analysis.band = band
+        analysis.query_fermilat_data()
+        analysis.get_source_coordinates(catalog)
+        analysis.write_config()
+        analysis.run_analysis()
 
     verbose("-> Entering StatisticAnalysis loop")
     while(True):
       if (analysis.select_next_source()==analysis.get_list_of_sources()):
         verbose('--> Waiting for the StatisticAnalysis threads to finish')
         while (not rqueue.empty()): time.sleep(10)
+        for _file_ in analysis.PHlist: os.remove(_file_)
+        os.remove(analysis.SCfile)
         break
 
-      analysis.arm_triggers()
-    
+      for band in ["lo","hi"]:
+        analysis.band = band
+        analysis.arm_triggers()
+
 
 ##### Main loop
 
@@ -485,14 +558,15 @@ if __name__ == '__main__':
   fpool = Pool(analysis.simthreads, worker, (fqueue,rqueue))
   verbose("-> Loading Fermi-LAT catalog")
   catalog = FermiCatalog(analysis.catalog)
-  
+
   while(True):
     full_analysis()
+    break
     time.sleep(3600)
 
   for p in xrange(analysis.simthreads):
     rqueue.put("stop")
-  
+
   fpool.close();
   fpool.join()
 
