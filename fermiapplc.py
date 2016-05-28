@@ -35,7 +35,8 @@ clearfile=True
 verbosemode=None
 
 def verbose(message):
-  if (verbosemode): printc("[VERBOSE] "+message)
+  from datetime import datetime
+  if (verbosemode): printc(str("[VERBOSE, %s] %s"%(datetime.strftime(datetime.now(),"%Y%m%d_%H%M%S"), str(message))))
 
 # Use Torque PBS
 jobscheduler=False
@@ -47,24 +48,29 @@ fpool    = None
 rpool    = None
 catalog  = None
 analysis = None
+analock  = {}
 
 def worker(fqueue,rqueue):
   import time
+  global analock
   verbose("%s busy" %(str(os.getpid())))
   while(True):
     try:
       if (not fqueue.empty()):
         verbose("fqueue is not empty")
         item = fqueue.get(True)
+        name=item.split("/")[-1].split(".conf")[0]
+        analock[name]='Busy[LC]'
         AppLC(item)
+        analock[name]='Done[LC]'
       elif (not rqueue.empty()):
         args = rqueue.get(True)
         verbose("rqueue is not empty: %s" %(str(args)))
         if (args=="stop"):
           verbose("Finished signal received, breaking the loop")
           break
-        else:
-          analyze_results(**args)
+        analyze_results(**args)
+
       time.sleep(1)
     except KeyboardInterrupt:
       break
@@ -151,14 +157,16 @@ class FermiCatalog(object):
 
     src = dict()
     for k in xrange(len(self.NameList)):
-      if name in str(self.NameList[k]):
-        src["arg"]      = k
-        src["raj2000"]  = self.Table[k][column_raj2000]
-        src["decj2000"] = self.Table[k][column_decj2000]
-        src["glon"]     = self.Table[k][column_glon]
-        src["glat"]     = self.Table[k][column_glat]
-        src["pwlindex"] = self.Table[k][column_pwlindex]
-        return(src)
+      for j in xrange(len(self.NameList[k])):
+        if name in str(self.NameList[k][j]):
+          self.name       = self.NameList[k][j]
+          src["arg"]      = k
+          src["raj2000"]  = self.Table[k][column_raj2000]
+          src["decj2000"] = self.Table[k][column_decj2000]
+          src["glon"]     = self.Table[k][column_glon]
+          src["glat"]     = self.Table[k][column_glat]
+          src["pwlindex"] = self.Table[k][column_pwlindex]
+          return(src)
 
     printc("Source name %s not found!." %name)
 
@@ -211,9 +219,16 @@ class Analysis(object):
     parser.add_argument('--index', dest='spindex',
       type=float, default=2.0,
       help='Spectral Index (assuming PWL) (default: 2.0)')
+    parser.add_argument('-v', '--verbose', dest='verbosemode',
+      action='store_true', 
+      help='Activate verbose mode')
 
     args = parser.parse_args()
     vars(self).update(args.__dict__)
+
+    # verbose?
+    global verbosemode
+    verbosemode=args.verbosemode
 
     # Update log file
     global tofile
@@ -240,17 +255,19 @@ class Analysis(object):
     import urllib2
     from astroquery.fermi import FermiLAT
     object=self.name
+    ra = self.RA
+    dec = self.DEC
     Erange = str("%d, %d" %(self.energymin,self.energymax))
     LATdatatype = "Extended"
     self.calculate_times()
     timesys = 'MET'
     obsdates = str("%s, %s" %(str(self.timemin),"END")) #str(self.timemax)))
     verbose("Query:")
-    verbose(str("%s, %s, %s, %s, %s, %s" \
-        %(object, Erange, self.roi, LATdatatype, obsdates, timesys)))
+    verbose(str("%s, %s, %s, %s, %s, %s, %s, %s" \
+        %(object, ra, dec, Erange, self.roi, LATdatatype, obsdates, timesys)))
 
     result = FermiLAT.query_object(\
-        name_or_coords=object,\
+        name_or_coords=str("%.4f, %.4f" %(ra,dec)),\
         energyrange_MeV=Erange,\
         searchradius=self.roi,\
         LATdatatype=LATdatatype,\
@@ -388,7 +405,7 @@ class Analysis(object):
     config['AppLC']['NLCbin'] = int(24*self.timewindow/self.binsize+0.5)
     config['AppLC']['rad']  = self.roi
     # Write config file
-    self.configfile = str("%s/%s_%sE.conf" %(self.output,self.name,self.band))
+    self.configfile = str("%s/%s_%s.conf" %(self.output,self.name,self.band))
     with open(self.configfile,'w') as f:
       config.write(f)
 
@@ -437,34 +454,45 @@ class Analysis(object):
 
   def arm_triggers(self):
     verbose("--> Preparing triggers for %s" %(analysis.name))
-    args={'outdir':self.output, 'source':self.name}
+    args={'outdir':self.output, 'source':self.name, 'band':self.band}
     global rqueue
     rqueue.put(args)
 
-def analyze_results(outdir,source,triggermode='local',fluxref=None,sigma=3):
+def analyze_results(outdir,source,band,triggermode='local',fluxref=None,sigma=3):
   import time
   from numpy import sum, sqrt
   import astropy.io.fits as pyfits
   from enrico.constants import AppLCPath
-  # Retrieve results
-  applcfile = str("%s/%s/%s/%s_fast_applc.fits" \
-      %(outdir, source, AppLCPath, source))
-
+  global analock
+  # Retrieve results 
+  applcfile = str("%s/%s_%s/%s/%s_fast_applc.fits" %(outdir, source, band, AppLCPath, source))
+  if (analock[source+"_"+band] not in ["Busy[LC]" or "Done[LC]"]):
+    verbose("--> Warning, inconsistent state for source %s: %s" %(source,analock[source+"_"+band]))
+  while (analock[source+"_"+band]=="Busy[LC]"): time.sleep(10)
+  analock[source+"_"+band]="Busy[ST]"
+  with pyfits.open(applcfile) as F:
+    applc = F[1].data
+  total_exp_prev = sum(applc['EXPOSURE'][:-1])
+  total_cts_prev = sum(applc['COUNTS'][:-1])
+  total_err_prev = sqrt(sum(applc['ERROR'][:-1]**2))
+  last_exp = applc['EXPOSURE'][-1]
+  last_cts = applc['COUNTS'][-1]
+  last_err = applc['ERROR'][-1]
+  printc("-> ##### %s #####" %source)
+  verbose("--> Contents of file %s" %(applcfile))
+  verbose(applc)
+  
+  '''
   trials=NTRIALS;
+
   while(True):
     try:
       F=pyfits.open(applcfile)
-    except:
-      time.sleep(30)
-      continue
-    else:
-      trials=NTRIALS
-
-    try:
       applc = F[1].data
     except:
       verbose("--> Cannot open fits table, closing it")
-      F.close()
+      try: F.close()
+      except: pass
       time.sleep(30)
       trials-=1
       if (trials==0):
@@ -493,6 +521,7 @@ def analyze_results(outdir,source,triggermode='local',fluxref=None,sigma=3):
   printc("-> ##### %s #####" %source)
   verbose("--> Contents of file %s" %(applcfile))
   verbose(applc)
+  '''
 
   if (triggermode=='local'):
     expratio = (1.*last_exp/total_exp_prev)
@@ -503,11 +532,13 @@ def analyze_results(outdir,source,triggermode='local',fluxref=None,sigma=3):
           %(last_cts/last_exp, last_err/last_exp))
       printc("--> ALERT: %s might be flaring! Excess is %1.2f sigma above average"\
         %(source,(last_cts-proj_cts)/proj_err))
+      analock[source+"_"+band]="Done[ST]"
       return(True)
     else:
       printc("-> Flux: (%e +/- %.2e) ph/cm2/s [%1.2f sigma]"\
           %(last_cts/last_exp, last_err/last_exp,\
             (last_cts-proj_cts)/proj_err))
+      analock[source+"_"+band]="Done[ST]"
       return(False)
 
 
@@ -516,7 +547,7 @@ def analyze_results(outdir,source,triggermode='local',fluxref=None,sigma=3):
 def full_analysis():
     verbose("-> Updating Fermi-LAT data")
     if (UPDATE_FERMI): update_fermilat_data()
-
+    analysis.blacklist = []
     # Point to the first source in the list
     verbose("-> Entering ScienceTools analysis loop")
     while(True):
@@ -527,22 +558,32 @@ def full_analysis():
         break
 
       for band in ["lo","hi"]:
+        if (str(analysis.name+"_"+band) in analysis.blacklist): continue 
+        analock[analysis.name+"_"+band] = ""
         analysis.band = band
-        analysis.query_fermilat_data()
-        analysis.get_source_coordinates(catalog)
-        analysis.write_config()
-        analysis.run_analysis()
+        try:
+          analysis.get_source_coordinates(catalog)
+          analysis.query_fermilat_data()
+          analysis.write_config()
+          analysis.run_analysis()
+        except:
+          verbose(str("-> Error analyzing %s_%s, blacklisting it" %(analysis.name,band)))
+          analysis.blacklist.append(analysis.name+"_"+band)
 
     verbose("-> Entering StatisticAnalysis loop")
     while(True):
       if (analysis.select_next_source()==analysis.get_list_of_sources()):
         verbose('--> Waiting for the StatisticAnalysis threads to finish')
         while (not rqueue.empty()): time.sleep(10)
-        for _file_ in analysis.PHlist: os.remove(_file_)
+        for _file_ in analysis.PHlist: 
+          verbose("-> Removing %s" %_file_)
+          os.remove(_file_)
+        verbose("-> Removing %s" %analysis.SCfile)
         os.remove(analysis.SCfile)
         break
 
       for band in ["lo","hi"]:
+        if (str(analysis.name+"_"+band) in analysis.blacklist): continue 
         analysis.band = band
         analysis.arm_triggers()
 
@@ -561,7 +602,7 @@ if __name__ == '__main__':
 
   while(True):
     full_analysis()
-    break
+    print(analock)
     time.sleep(3600)
 
   for p in xrange(analysis.simthreads):
